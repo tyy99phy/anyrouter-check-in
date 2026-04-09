@@ -135,8 +135,10 @@ class AppConfig:
 class AccountConfig:
 	"""账号配置"""
 
-	cookies: dict | str
-	api_user: str
+	cookies: dict | str | None = None
+	api_user: str | None = None
+	username: str | None = None
+	password: str | None = None
 	provider: str = 'anyrouter'
 	name: str | None = None
 
@@ -146,7 +148,18 @@ class AccountConfig:
 		provider = data.get('provider', 'anyrouter')
 		name = data.get('name', f'Account {index + 1}')
 
-		return cls(cookies=data['cookies'], api_user=data['api_user'], provider=provider, name=name if name else None)
+		return cls(
+			cookies=data.get('cookies'),
+			api_user=data.get('api_user'),
+			username=data.get('username'),
+			password=data.get('password'),
+			provider=provider,
+			name=name if name else None,
+		)
+
+	def uses_auto_login(self) -> bool:
+		"""是否使用自动登录模式"""
+		return bool(self.username and self.password)
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -173,8 +186,10 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
 				return None
 
-			if 'cookies' not in account_dict or 'api_user' not in account_dict:
-				print(f'ERROR: Account {i + 1} missing required fields (cookies, api_user)')
+			has_credentials = 'username' in account_dict and 'password' in account_dict
+			has_cookies = 'cookies' in account_dict and 'api_user' in account_dict
+			if not has_credentials and not has_cookies:
+				print(f'ERROR: Account {i + 1} requires either (username, password) or (cookies, api_user)')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:

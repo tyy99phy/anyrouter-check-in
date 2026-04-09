@@ -12,10 +12,11 @@ from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
 
+from utils.auth import auto_login
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.notify import notify
+from utils.waf import solve_waf_challenge
 
 load_dotenv()
 
@@ -65,68 +66,19 @@ def parse_cookies(cookies_data):
 	return {}
 
 
-async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
-	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
-	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
+_waf_cookies_cache: dict[str, dict] = {}
 
-	async with async_playwright() as p:
-		import tempfile
 
-		with tempfile.TemporaryDirectory() as temp_dir:
-			context = await p.chromium.launch_persistent_context(
-				user_data_dir=temp_dir,
-				headless=False,
-				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				viewport={'width': 1920, 'height': 1080},
-				args=[
-					'--disable-blink-features=AutomationControlled',
-					'--disable-dev-shm-usage',
-					'--disable-web-security',
-					'--disable-features=VizDisplayCompositor',
-					'--no-sandbox',
-				],
-			)
+def get_waf_cookies(domain: str) -> dict | None:
+	"""获取 WAF cookies（带缓存，同一 domain 只解一次）"""
+	if domain in _waf_cookies_cache:
+		print(f'[INFO] WAF: Using cached cookies for {domain}')
+		return _waf_cookies_cache[domain]
 
-			page = await context.new_page()
-
-			try:
-				print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
-
-				await page.goto(login_url, wait_until='networkidle')
-
-				try:
-					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
-				except Exception:
-					await page.wait_for_timeout(3000)
-
-				cookies = await page.context.cookies()
-
-				waf_cookies = {}
-				for cookie in cookies:
-					cookie_name = cookie.get('name')
-					cookie_value = cookie.get('value')
-					if cookie_name in required_cookies and cookie_value is not None:
-						waf_cookies[cookie_name] = cookie_value
-
-				print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
-
-				missing_cookies = [c for c in required_cookies if c not in waf_cookies]
-
-				if missing_cookies:
-					print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
-					await context.close()
-					return None
-
-				print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
-
-				await context.close()
-
-				return waf_cookies
-
-			except Exception as e:
-				print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
-				await context.close()
-				return None
+	cookies = solve_waf_challenge(domain)
+	if cookies:
+		_waf_cookies_cache[domain] = cookies
+	return cookies
 
 
 def get_user_info(client, headers, user_info_url: str):
@@ -151,13 +103,12 @@ def get_user_info(client, headers, user_info_url: str):
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
 
 
-async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
+def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
 	"""准备请求所需的 cookies（可能包含 WAF cookies）"""
 	waf_cookies = {}
 
 	if provider_config.needs_waf_cookies():
-		login_url = f'{provider_config.domain}{provider_config.login_path}'
-		waf_cookies = await get_waf_cookies_with_playwright(account_name, login_url, provider_config.waf_cookie_names)
+		waf_cookies = get_waf_cookies(provider_config.domain)
 		if not waf_cookies:
 			print(f'[FAILED] {account_name}: Unable to get WAF cookies')
 			return None
@@ -264,18 +215,34 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None
+		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	user_cookies = parse_cookies(account.cookies)
-	if not user_cookies:
-		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
+	# 自动登录模式：用 username/password 获取 session
+	if account.uses_auto_login():
+		print(f'[INFO] {account_name}: Using auto-login mode')
+		waf_cookies = get_waf_cookies(provider_config.domain)
+		if not waf_cookies:
+			return False, None, None
 
-	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
-	if not all_cookies:
-		return False, None
+		auth_result = auto_login(provider_config.domain, account.username, account.password, waf_cookies)
+		if not auth_result:
+			return False, None, None
+
+		all_cookies = auth_result['cookies']
+		api_user = auth_result['user_id']
+	else:
+		# 传统模式：使用手动提供的 cookies
+		user_cookies = parse_cookies(account.cookies)
+		if not user_cookies:
+			print(f'[FAILED] {account_name}: Invalid configuration format')
+			return False, None, None
+
+		all_cookies = prepare_cookies(account_name, provider_config, user_cookies)
+		if not all_cookies:
+			return False, None, None
+		api_user = account.api_user
 
 	client = httpx.Client(http2=True, timeout=30.0)
 
@@ -293,7 +260,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			'Sec-Fetch-Dest': 'empty',
 			'Sec-Fetch-Mode': 'cors',
 			'Sec-Fetch-Site': 'same-origin',
-			provider_config.api_user_key: account.api_user,
+			provider_config.api_user_key: api_user,
 		}
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
@@ -323,7 +290,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 async def main():
 	"""主函数"""
-	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)')
+	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started')
 	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
 	app_config = AppConfig.load_from_env()
